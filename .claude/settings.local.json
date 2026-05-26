@@ -1,0 +1,14 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(Get-ChildItem -Path \"C:\\\\Users\\\\User\\\\Desktop\\\\VolleyballProject\" -Force)",
+      "Bash(Select-Object Name, PSIsContainer)",
+      "Bash(Format-Table -AutoSize)",
+      "Bash(New-Item -ItemType Directory -Force \"C:\\\\Users\\\\User\\\\Desktop\\\\VolleyballProject\\\\.claude\\\\skills\\\\scouting-report\")",
+      "Bash(Out-Null)",
+      "PowerShell(where.exe gh 2>$null; if \\(-not $?\\) { \"gh not found\" })",
+      "PowerShell(git *)",
+      "Bash(git *)"
+    ]
+  }
+}
