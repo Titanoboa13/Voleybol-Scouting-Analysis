@@ -36,6 +36,17 @@ POSITION_NAMES = {
     6: 'Libero',
 }
 
+# Distinct, high-contrast colour per position. Keyed by position_number so the
+# same palette is reusable anywhere (avatars, badges, future charts). All five
+# are dark enough for white/light text to stay readable on Streamlit's dark theme.
+POSITION_COLORS = {
+    1: '#2980b9',  # Setter          — blue
+    2: '#e67e22',  # Opposite Hitter — orange
+    3: '#27ae60',  # Middle Blocker  — green
+    4: '#8e44ad',  # Outside Hitter  — purple
+    6: '#c0392b',  # Libero          — red
+}
+
 METRICS = ['height', 'spike', 'block', 'jump_power']
 METRIC_LABELS = {
     'height':     'Height (cm)',
@@ -614,6 +625,109 @@ def generate_ai_commentary(player1_name, player2_name, language):
     return text
 
 
+# ── Section 5c: Player Profile helpers (avatar, age, detailed AI profile) ──
+def _compute_age(dob):
+    """Integer age as of today from a parsed date/Timestamp, or None when the
+    value is missing/unparseable (NaT). Never raises."""
+    if dob is None or pd.isna(dob):
+        return None
+    today = date.today()
+    return today.year - dob.year - ((today.month, today.day) < (dob.month, dob.day))
+
+
+def _initials(name):
+    """First letter of the first and last name parts (max 2), uppercased."""
+    parts = [p for p in str(name).split() if p]
+    if not parts:
+        return "?"
+    letters = parts[0][0] + (parts[-1][0] if len(parts) > 1 else "")
+    return letters.upper()
+
+
+def _avatar_html(name, position_number, size=96):
+    """Circular initials avatar coloured by position, white text for contrast.
+    Rendered via st.markdown(unsafe_allow_html=True)."""
+    color = POSITION_COLORS.get(int(position_number), '#555555')
+    return (
+        f"<div style='width:{size}px;height:{size}px;border-radius:50%;"
+        f"background-color:{color};display:flex;align-items:center;"
+        f"justify-content:center;color:#ffffff;font-family:Arial;"
+        f"font-size:{int(size * 0.4)}px;font-weight:bold;letter-spacing:1px;"
+        f"box-shadow:0 2px 6px rgba(0,0,0,0.35);'>{_initials(name)}</div>"
+    )
+
+
+@st.cache_data(show_spinner=False)
+def generate_player_profile(player_name, language):
+    """Detailed Gemini scouting profile for a single player in the chosen
+    language. Cached on (player_name, language) so each combination triggers at
+    most one API call. Feeds Gemini ONLY real numeric stats plus how the player
+    compares to their position benchmark averages. Raises on failure so the
+    caller can warn and so transient errors are not cached."""
+    key = _get_gemini_key()
+    if not key:
+        raise RuntimeError("Gemini key not configured")
+
+    row     = df_clean[df_clean['name'] == player_name].iloc[0]
+    pos_num = int(row['position_number'])
+    pos     = POSITION_NAMES.get(pos_num, 'Unknown')
+    avgs    = benchmark_avgs.get(pos_num, {})
+    age     = _compute_age(row.get('dob'))
+    age_str = f"{age} years" if age is not None else "unknown"
+
+    stat_lines = [
+        f"Position: {pos}",
+        f"Age: {age_str}",
+        f"Height: {float(row['height']):.0f} cm",
+        f"Spike reach: {float(row['spike']):.0f} cm",
+        f"Block reach: {float(row['block']):.0f} cm",
+        f"Jump power: {float(row['jump_power']):.0f} cm",
+        f"Spike percentile: {float(row['spike_percentile']):.0f}",
+        f"Block percentile: {float(row['block_percentile']):.0f}",
+    ]
+
+    bench_lines = []
+    for m in ['height', 'spike', 'block', 'jump_power']:
+        if m in avgs:
+            val  = float(row[m])
+            diff = val - avgs[m]
+            sign = "above" if diff >= 0 else "below"
+            bench_lines.append(
+                f"{METRIC_SHORT[m]}: {val:.0f} cm "
+                f"({abs(diff):.0f} cm {sign} the {pos} average of {avgs[m]:.0f} cm)"
+            )
+
+    lang_line = ("Write the profile in Turkish." if language == "Türkçe"
+                 else "Write the profile in English.")
+
+    prompt = (
+        "You are an expert volleyball scout writing a DETAILED scouting profile "
+        "for a single player. Base everything ONLY on the statistics provided "
+        "below. Invent NO biographical facts — no teams, clubs, achievements, "
+        "career history, nationality, or personal details that are not in the "
+        "data. You MAY interpret the numbers (for example, an elite block "
+        "percentile suggests strong net defense), but never fabricate facts.\n\n"
+        "Structure the profile in three clearly separated paragraphs with these "
+        "headings:\n"
+        "1. Strengths\n"
+        "2. Weaknesses / areas to watch\n"
+        "3. Overall assessment\n\n"
+        "PLAYER STATISTICS:\n" + "\n".join(stat_lines) + "\n\n"
+        f"COMPARISON TO {pos.upper()} POSITION BENCHMARK AVERAGES:\n"
+        + ("\n".join(bench_lines) if bench_lines
+           else "No benchmark available for this position.")
+        + "\n\n" + lang_line
+    )
+
+    from google import genai
+    client = genai.Client(api_key=key)
+    resp = client.models.generate_content(model=GEMINI_MODEL, contents=prompt)
+    text = (resp.text or "").strip()
+    if not text:
+        raise ValueError("Gemini returned an empty response")
+    return text
+
+
 # ── Section 6: Data loading (cached) ───────────────────────────────────────
 @st.cache_data
 def load_data():
@@ -624,6 +738,17 @@ def load_data():
     df_clean['block_percentile'] = df_clean['block'].rank(pct=True) * 100
     df_clean['scout_score']      = (df_clean['spike_percentile'] + df_clean['block_percentile']) / 2
     df_clean['position_name']    = df_clean['position_number'].map(POSITION_NAMES)
+
+    # date_of_birth is a DD/MM/YYYY string. Parse it to a real datetime once here;
+    # errors='coerce' turns any malformed/missing value into NaT so the load never
+    # crashes. Age itself is computed at render time via _compute_age() so it never
+    # goes stale across a year boundary while this cached frame is held.
+    if 'date_of_birth' in df_clean.columns:
+        df_clean['dob'] = pd.to_datetime(
+            df_clean['date_of_birth'], format='%d/%m/%Y', errors='coerce'
+        )
+    else:
+        df_clean['dob'] = pd.NaT
 
     _metric_min = {m: df_clean[m].min() for m in RADAR_METRICS}
     _metric_max = {m: df_clean[m].max() for m in RADAR_METRICS}
@@ -681,8 +806,9 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-tab_scout, tab_bench, tab_compare, tab_team = st.tabs(
-    ['Player Scout', 'Position Benchmarks', 'Player Comparison', 'Team Analysis']
+tab_scout, tab_bench, tab_compare, tab_team, tab_profile = st.tabs(
+    ['Player Scout', 'Position Benchmarks', 'Player Comparison',
+     'Team Analysis', 'Player Profile']
 )
 
 # ── Tab 1: Player Scout ────────────────────────────────────────────────────
@@ -922,3 +1048,67 @@ with tab_team:
                     )
                     st.dataframe(pd.DataFrame(rec_rows),
                                  hide_index=True, width='stretch')
+
+# ── Tab 5: Player Profile ──────────────────────────────────────────────────
+with tab_profile:
+    st.subheader("Player Profile Card")
+    st.caption("Pick a player to view their scouting card — initials avatar, "
+               "key stats, and a detailed AI scouting profile.")
+
+    profile_player = st.selectbox(
+        "Select player", _player_values, index=0,
+        format_func=lambda v: _player_labels[v], key='profile_player',
+    )
+
+    prow     = df_clean[df_clean['name'] == profile_player].iloc[0]
+    pos_num  = int(prow['position_number'])
+    pos_name = POSITION_NAMES.get(pos_num, 'Unknown')
+    p_age    = _compute_age(prow.get('dob'))
+    age_disp = str(p_age) if p_age is not None else "—"
+    country  = int(prow['country']) if pd.notna(prow['country']) else '—'
+
+    # ── Card header: avatar beside identity ────────────────────────────────
+    av_col, id_col = st.columns([1, 4])
+    with av_col:
+        st.markdown(_avatar_html(profile_player, pos_num), unsafe_allow_html=True)
+    with id_col:
+        st.markdown(
+            f"<div style='font-size:26px;font-weight:bold;color:#e0e0e0;"
+            f"font-family:Arial;'>{profile_player}</div>"
+            f"<div style='display:inline-block;margin-top:6px;padding:3px 12px;"
+            f"border-radius:12px;background-color:{POSITION_COLORS.get(pos_num, '#555555')};"
+            f"color:#ffffff;font-size:13px;font-weight:bold;font-family:Arial;'>"
+            f"{pos_name}</div>"
+            f"<div style='margin-top:8px;color:#9aa5b1;font-size:13px;"
+            f"font-family:Arial;'>Age: {age_disp}</div>",
+            unsafe_allow_html=True,
+        )
+
+    st.write("")
+
+    # ── Key stats ──────────────────────────────────────────────────────────
+    s1, s2, s3, s4 = st.columns(4)
+    s1.metric("Height (cm)",      f"{float(prow['height']):.0f}")
+    s2.metric("Spike Reach (cm)", f"{float(prow['spike']):.0f}")
+    s3.metric("Block Reach (cm)", f"{float(prow['block']):.0f}")
+    s4.metric("Jump Power (cm)",  f"{float(prow['jump_power']):.0f}")
+    s5, s6 = st.columns(2)
+    s5.metric("Spike Percentile", f"{float(prow['spike_percentile']):.0f}")
+    s6.metric("Block Percentile", f"{float(prow['block_percentile']):.0f}")
+
+    # ── Detailed AI Scouting Profile (Gemini) ──────────────────────────────
+    st.markdown("---")
+    st.subheader("AI Scouting Profile")
+    profile_lang = st.radio(
+        "Profil dili / Profile language",
+        ["Türkçe", "English"], index=0, horizontal=True, key='profile_lang',
+    )
+    if _get_gemini_key() is None:
+        st.info("AI profile unavailable: Gemini key not configured")
+    else:
+        try:
+            with st.spinner("Generating detailed AI profile..."):
+                profile_text = generate_player_profile(profile_player, profile_lang)
+            st.markdown(profile_text)
+        except Exception as exc:
+            st.warning(f"AI profile unavailable: {type(exc).__name__}: {exc}")
