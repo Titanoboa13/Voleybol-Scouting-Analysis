@@ -13,7 +13,7 @@ Volleyball player scouting and performance analysis tool. Loads player data, per
 Install dependencies (global pip, no venv — streamlit.exe is not on PATH):
 
 ```
-pip install streamlit==1.58.0 pandas plotly reportlab
+pip install streamlit==1.58.0 pandas plotly reportlab google-genai==2.7.0
 ```
 
 `clean_data.csv` must be in the project root.
@@ -33,10 +33,11 @@ Access at `http://127.0.0.1:8060`. Use `python -m streamlit`, not bare `streamli
 - **Pure-logic helpers** (`normalize`, `_pct_rank`, `_player_metric_table`, `_h2h_comparison_table`, `_build_recommendation`, `generate_scouting_pdf`) are ported verbatim from `Model.ipynb` with no Streamlit dependency.
 - **Benchmark and weakness tables** rendered via `st.markdown(styler.to_html(), unsafe_allow_html=True)` — required because `st.dataframe`'s Arrow grid overrides custom text colors from pandas Styler on Streamlit's dark theme. Highlighted cells use `set_table_styles` with per-cell CSS class selectors (`td.rowR.colC` / `tr td.colN`) placed last in the style list with `!important` so they win on every row regardless of theme.
 - **PDF generation** is lazy: clicking "Generate PDF Report" builds bytes into `st.session_state`; the download button appears only after generation.
+- **Gemini AI commentary** (Player Comparison tab): uses `google-genai==2.7.0` SDK, model `gemini-2.5-flash`. Key is read from `st.secrets["GEMINI_API_KEY"]` (stored in `.streamlit/secrets.toml`, git-ignored). The feature degrades gracefully — the tab works fully with no key present. Commentary is cached in `st.session_state` keyed by the player pair so repeat views skip the API call. A Türkçe/English toggle controls the language of the AI output. Helper: `_get_gemini_key()` returns the key or `None` without raising.
 
 ## Environment
 
-- Python 3.14.5 · pandas 3.0.3 · plotly 6.7.0 · reportlab 4.5.1 · streamlit 1.58.0
+- Python 3.14.5 · pandas 3.0.3 · plotly 6.7.0 · reportlab 4.5.1 · streamlit 1.58.0 · google-genai 2.7.0
 - No breaking changes in pandas 3.0 for `rank(pct=True)`, `quantile`, or `mean` defaults.
 - `streamlit.exe` not on PATH — always launch via `python -m streamlit`.
 

@@ -90,6 +90,11 @@ SAMPLE_CSV = (
     "Kim Lee,6,170,268,261\n"
 )
 
+# Gemini AI commentary (Player Comparison tab only). Model string confirmed
+# working via test_gemini.py. The key lives in .streamlit/secrets.toml.
+GEMINI_MODEL = "gemini-2.5-flash"
+_GEMINI_PLACEHOLDER = "PASTE_YOUR_KEY_HERE"
+
 
 # ── Section 3: Verbatim stat / PDF helpers (no Dash dependency) ────────────
 # normalize() and _pct_rank() reference the module-level globals df_clean,
@@ -543,6 +548,72 @@ def build_comparison(player1, player2):
     return fig, table_df
 
 
+# ── Section 5b: Gemini AI commentary (Player Comparison tab) ───────────────
+def _get_gemini_key():
+    """Return a usable Gemini key from st.secrets, or None if it is missing or
+    still the placeholder. Never raises — a missing secrets file is fine."""
+    try:
+        key = st.secrets["GEMINI_API_KEY"]
+    except Exception:
+        return None
+    key = (key or "").strip()
+    if not key or key == _GEMINI_PLACEHOLDER:
+        return None
+    return key
+
+
+@st.cache_data(show_spinner=False)
+def generate_ai_commentary(player1_name, player2_name, language):
+    """Short Gemini scouting note comparing two players, in the chosen language.
+
+    Cached on (player1_name, player2_name, language) so each unique combination
+    triggers at most one API call; repeats return the cached text for free.
+    Returns the commentary text. Raises on API failure so the caller can show a
+    warning AND so transient failures are not cached (they can be retried)."""
+    key = _get_gemini_key()
+    if not key:
+        # Caller checks the key first, so this is just a safety guard.
+        raise RuntimeError("Gemini key not configured")
+
+    row1 = df_clean[df_clean['name'] == player1_name].iloc[0]
+    row2 = df_clean[df_clean['name'] == player2_name].iloc[0]
+
+    def _stat_block(name, row):
+        pos = POSITION_NAMES.get(int(row['position_number']), 'Unknown')
+        return (
+            f"{name} (position: {pos}): "
+            f"height={float(row['height']):.0f} cm, "
+            f"spike reach={float(row['spike']):.0f} cm, "
+            f"block reach={float(row['block']):.0f} cm, "
+            f"jump power={float(row['jump_power']):.0f} cm, "
+            f"spike percentile={float(row['spike_percentile']):.0f}, "
+            f"block percentile={float(row['block_percentile']):.0f}"
+        )
+
+    lang_line = ("Write the note in Turkish." if language == "Türkçe"
+                 else "Write the note in English.")
+
+    prompt = (
+        "You are a volleyball scout writing a brief head-to-head note comparing "
+        "two players. Base your comparison ONLY on the statistics provided below. "
+        "Do NOT invent any biographical details — no career history, teams, ages, "
+        "nationalities, or achievements that are not in the data. "
+        "Write 2-4 sentences maximum in a concise scouting tone, and state clearly "
+        "which player has the edge and in which attributes.\n\n"
+        f"{_stat_block(player1_name, row1)}\n"
+        f"{_stat_block(player2_name, row2)}\n\n"
+        f"{lang_line}"
+    )
+
+    from google import genai
+    client = genai.Client(api_key=key)
+    resp = client.models.generate_content(model=GEMINI_MODEL, contents=prompt)
+    text = (resp.text or "").strip()
+    if not text:
+        raise ValueError("Gemini returned an empty response")
+    return text
+
+
 # ── Section 6: Data loading (cached) ───────────────────────────────────────
 @st.cache_data
 def load_data():
@@ -720,6 +791,23 @@ with tab_compare:
     radar_fig, comp_table = build_comparison(player1, player2)
     st.plotly_chart(radar_fig, width='stretch')
     st.dataframe(comp_table, hide_index=True, width='stretch')
+
+    # ── AI Scouting Note (Gemini) ──────────────────────────────────────────
+    st.markdown("---")
+    st.subheader("AI Scouting Note")
+    ai_lang = st.radio(
+        "Yorum dili / Commentary language",
+        ["Türkçe", "English"], index=0, horizontal=True,
+    )
+    if _get_gemini_key() is None:
+        st.info("AI commentary unavailable: Gemini key not configured")
+    else:
+        try:
+            with st.spinner("Generating AI commentary..."):
+                ai_note = generate_ai_commentary(player1, player2, ai_lang)
+            st.markdown(ai_note)
+        except Exception as exc:
+            st.warning(f"AI commentary unavailable: {type(exc).__name__}: {exc}")
 
 # ── Tab 4: Team Analysis ───────────────────────────────────────────────────
 with tab_team:

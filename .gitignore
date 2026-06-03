@@ -10,3 +10,4 @@ data/chroma_db/
 .streamlit/secrets.toml
 desktop.ini
 .claude/settings.local.json
+test_gemini.py
