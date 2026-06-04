@@ -6,8 +6,13 @@ __pycache__/
 *.env
 .ipynb_checkpoints/
 *.db
+*.log
 data/chroma_db/
 .streamlit/secrets.toml
+# Locally-scraped Wikipedia datasets — stay local, never push to GitHub
+data/final_dataset.csv
+data/new_dataset.csv
+data/new_dataset_test.csv
 desktop.ini
 .claude/settings.local.json
 test_gemini.py

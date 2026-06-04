@@ -112,6 +112,23 @@ _GEMINI_PLACEHOLDER = "PASTE_YOUR_KEY_HERE"
 # _metric_min and _metric_max, which are assigned in Section 7 before any UI
 # code path (Section 8) calls them.
 
+def _num_or_none(value):
+    """Return float(value) when it is a real number, else None.
+
+    The dataset (data/final_dataset.csv) leaves spike/block/height blank (NaN)
+    for players Wikipedia doesn't cover. Every display/calculation guards on this
+    so a blank renders as '—' and never poisons a percentile, benchmark, or PDF."""
+    if value is None or pd.isna(value):
+        return None
+    return float(value)
+
+
+def _fmt_int(value, dash='—'):
+    """int(value) when present, else the dash placeholder."""
+    n = _num_or_none(value)
+    return int(round(n)) if n is not None else dash
+
+
 def normalize(value, metric):
     mn, mx = _metric_min[metric], _metric_max[metric]
     if mx == mn:
@@ -120,16 +137,23 @@ def normalize(value, metric):
 
 
 def _pct_rank(value, col):
-    """Fraction of df_clean rows with col <= value, expressed as 0-100."""
+    """Fraction of df_clean rows with col <= value, expressed as 0-100.
+    Returns None when value is missing (so callers can render '—')."""
+    if value is None or pd.isna(value):
+        return None
     return round((df_clean[col] <= value).mean() * 100, 1)
 
 
 def _player_metric_table(row):
     data = [['Metric', 'Value', 'Percentile Rank']]
     for label, col, unit in PDF_METRICS:
-        val = float(row[col])
+        val = _num_or_none(row[col])
+        if val is None:
+            data.append([label, '—', '—'])
+            continue
         pct = _pct_rank(val, col)
-        data.append([label, f"{val:.1f} {unit}", f"{pct}%"])
+        data.append([label, f"{val:.1f} {unit}",
+                     f"{pct}%" if pct is not None else '—'])
     t = Table(data, colWidths=[7*cm, 5*cm, 6*cm])
     t.setStyle(TableStyle([
         ('BACKGROUND',     (0, 0), (-1,  0), _PDF_NAVY),
@@ -155,10 +179,12 @@ def _h2h_comparison_table(row1, row2, p1_name, p2_name):
     win_style = []
 
     for i, (label, col, unit) in enumerate(PDF_METRICS, start=1):
-        v1, v2 = float(row1[col]), float(row2[col])
-        s1 = f"{v1:.1f} {unit}"
-        s2 = f"{v2:.1f} {unit}"
-        if v1 > v2:
+        v1, v2 = _num_or_none(row1[col]), _num_or_none(row2[col])
+        s1 = f"{v1:.1f} {unit}" if v1 is not None else '—'
+        s2 = f"{v2:.1f} {unit}" if v2 is not None else '—'
+        if v1 is None or v2 is None:
+            edge = '—'                      # can't compare when a stat is missing
+        elif v1 > v2:
             edge = f'{p1s} ▲'
             win_style += [
                 ('BACKGROUND', (1, i), (1, i), _PDF_GREEN),
@@ -199,16 +225,29 @@ def _build_recommendation(row1, row2, p1_name, p2_name):
     p1_pos = POSITION_NAMES.get(int(row1['position_number']), 'Unknown')
     p2_pos = POSITION_NAMES.get(int(row2['position_number']), 'Unknown')
 
-    p1_leads, p2_leads = [], []
+    # Only metrics both players actually have are comparable.
+    p1_leads, p2_leads, ties = [], [], 0
     for label, col, _ in PDF_METRICS:
-        v1, v2 = float(row1[col]), float(row2[col])
+        v1, v2 = _num_or_none(row1[col]), _num_or_none(row2[col])
+        if v1 is None or v2 is None:
+            continue
         if v1 > v2:
             p1_leads.append(label)
         elif v2 > v1:
             p2_leads.append(label)
+        else:
+            ties += 1
 
     p1_wins, p2_wins = len(p1_leads), len(p2_leads)
-    total = len(PDF_METRICS)
+    total = p1_wins + p2_wins + ties
+
+    if total == 0:
+        return (
+            f"Insufficient comparable statistics between {p1_name} ({p1_pos}) and "
+            f"{p2_name} ({p2_pos}) — one or both players are missing the measured "
+            f"attributes (spike/block reach), so no head-to-head recommendation can "
+            f"be made on physical metrics alone."
+        )
 
     if p1_wins > p2_wins:
         stronger, weaker   = p1_name, p2_name
@@ -221,8 +260,10 @@ def _build_recommendation(row1, row2, p1_name, p2_name):
         s_wins             = p2_wins
         s_metrics, w_metrics = p2_leads, p1_leads
     else:
-        # Spike tiebreaker
-        if float(row1['spike']) >= float(row2['spike']):
+        # Spike tiebreaker (a missing spike loses the tiebreak)
+        _s1 = _num_or_none(row1['spike'])
+        _s2 = _num_or_none(row2['spike'])
+        if (_s1 if _s1 is not None else -1) >= (_s2 if _s2 is not None else -1):
             stronger, weaker   = p1_name, p2_name
             stronger_pos       = p1_pos
             s_metrics, w_metrics = p1_leads, p2_leads
@@ -250,20 +291,20 @@ def _build_recommendation(row1, row2, p1_name, p2_name):
     if w_metrics:
         detail += f" {weaker} counters with an edge in: {', '.join(w_metrics)}."
 
-    # Jump power note (meaningful if gap ≥ 8 cm)
-    jp1, jp2 = float(row1['jump_power']), float(row2['jump_power'])
+    # Jump power note (meaningful if gap ≥ 8 cm; skip when either is missing)
+    jp1, jp2 = _num_or_none(row1['jump_power']), _num_or_none(row2['jump_power'])
     jp_note = ''
-    if abs(jp1 - jp2) >= 8:
+    if jp1 is not None and jp2 is not None and abs(jp1 - jp2) >= 8:
         jp_winner = p1_name if jp1 > jp2 else p2_name
         jp_note = (
             f" A jump-power differential of {abs(jp1 - jp2):.0f} cm in favour of "
             f"{jp_winner} signals superior explosive ability at the net."
         )
 
-    # Spike percentile note (meaningful if gap ≥ 10 pp)
-    sp1, sp2 = float(row1['spike_percentile']), float(row2['spike_percentile'])
+    # Spike percentile note (meaningful if gap ≥ 10 pp; skip when either missing)
+    sp1, sp2 = _num_or_none(row1['spike_percentile']), _num_or_none(row2['spike_percentile'])
     sp_note = ''
-    if abs(sp1 - sp2) >= 10:
+    if sp1 is not None and sp2 is not None and abs(sp1 - sp2) >= 10:
         sp_winner = p1_name if sp1 > sp2 else p2_name
         top_pct   = round(100 - max(sp1, sp2), 0)
         sp_note   = (
@@ -471,12 +512,13 @@ def build_transfer_targets(score_rows):
         rec_rows   = [
             {
                 'Name':       row['name'],
-                'Country':    int(row['country']) if pd.notna(row['country']) else '?',
-                'Height (cm)': int(row['height']),
-                'Spike (cm)':  int(row['spike']),
-                'Block (cm)':  int(row['block']),
-                'Jump Power':  int(row['jump_power']),
-                'Spike %ile':  round(row['spike_percentile'], 1),
+                'Country':    row['country'] if pd.notna(row['country']) else '?',
+                'Height (cm)': _fmt_int(row['height']),
+                'Spike (cm)':  _fmt_int(row['spike']),
+                'Block (cm)':  _fmt_int(row['block']),
+                'Jump Power':  _fmt_int(row['jump_power']),
+                'Spike %ile':  round(row['spike_percentile'], 1)
+                               if pd.notna(row['spike_percentile']) else '—',
             }
             for _, row in candidates.iterrows()
         ]
@@ -525,38 +567,63 @@ def build_comparison(player1, player2):
     row1 = df_clean[df_clean['name'] == player1].iloc[0]
     row2 = df_clean[df_clean['name'] == player2].iloc[0]
 
-    categories  = [RADAR_LABELS[m] for m in RADAR_METRICS]
-    cats_closed = categories + [categories[0]]
-    p1_norm = [normalize(row1[m], m) for m in RADAR_METRICS]
-    p2_norm = [normalize(row2[m], m) for m in RADAR_METRICS]
+    # Only plot axes where BOTH players have a value — a missing stat would
+    # otherwise distort or break the polygon. Dropped axes are reported back so
+    # the UI can tell the user which were omitted.
+    common = [m for m in RADAR_METRICS
+              if _num_or_none(row1[m]) is not None and _num_or_none(row2[m]) is not None]
+    dropped = [m for m in RADAR_METRICS if m not in common]
+    note = None
+    if dropped:
+        note = ("Radar axes omitted (missing data for one or both players): "
+                + ", ".join(RADAR_LABELS[m] for m in dropped) + ".")
 
     fig = go.Figure()
-    fig.add_trace(go.Scatterpolar(
-        r=p1_norm + [p1_norm[0]], theta=cats_closed, fill='toself', name=player1,
-        line=dict(color='#2980b9', width=2), fillcolor='rgba(41,128,185,0.2)',
-    ))
-    fig.add_trace(go.Scatterpolar(
-        r=p2_norm + [p2_norm[0]], theta=cats_closed, fill='toself', name=player2,
-        line=dict(color='#e74c3c', width=2), fillcolor='rgba(231,76,60,0.2)',
-    ))
-    fig.update_layout(
-        polar=dict(radialaxis=dict(visible=True, range=[0, 100], tickfont=dict(size=9))),
-        showlegend=True, legend=dict(font=dict(family='Arial')),
-        title=dict(text=f"{player1}  vs  {player2}",
-                   font=dict(family='Arial', color='#2c3e50')),
-        font=dict(family='Arial'),
-    )
+    if len(common) >= 3:
+        categories  = [RADAR_LABELS[m] for m in common]
+        cats_closed = categories + [categories[0]]
+        p1_norm = [normalize(row1[m], m) for m in common]
+        p2_norm = [normalize(row2[m], m) for m in common]
+        fig.add_trace(go.Scatterpolar(
+            r=p1_norm + [p1_norm[0]], theta=cats_closed, fill='toself', name=player1,
+            line=dict(color='#2980b9', width=2), fillcolor='rgba(41,128,185,0.2)',
+        ))
+        fig.add_trace(go.Scatterpolar(
+            r=p2_norm + [p2_norm[0]], theta=cats_closed, fill='toself', name=player2,
+            line=dict(color='#e74c3c', width=2), fillcolor='rgba(231,76,60,0.2)',
+        ))
+        fig.update_layout(
+            polar=dict(radialaxis=dict(visible=True, range=[0, 100], tickfont=dict(size=9))),
+            showlegend=True, legend=dict(font=dict(family='Arial')),
+            title=dict(text=f"{player1}  vs  {player2}",
+                       font=dict(family='Arial', color='#2c3e50')),
+            font=dict(family='Arial'),
+        )
+    else:
+        fig.add_annotation(
+            text=("Not enough shared metrics to draw a radar "
+                  "(need at least 3 that both players have)."),
+            showarrow=False, font=dict(family='Arial', size=14, color='#7b241c'),
+        )
+        fig.update_layout(
+            title=dict(text=f"{player1}  vs  {player2}",
+                       font=dict(family='Arial', color='#2c3e50')),
+            xaxis=dict(visible=False), yaxis=dict(visible=False),
+            font=dict(family='Arial'),
+        )
 
-    pos1 = POSITION_NAMES.get(row1['position_number'], '?')
-    pos2 = POSITION_NAMES.get(row2['position_number'], '?')
-    table_rows = (
-        [{'Metric': 'Position', player1: pos1, player2: pos2}] +
-        [{'Metric': RADAR_RAW_LABELS[m],
-          player1: str(round(row1[m], 1)), player2: str(round(row2[m], 1))}
-         for m in RADAR_METRICS]
-    )
+    pos1 = POSITION_NAMES.get(int(row1['position_number']), '?')
+    pos2 = POSITION_NAMES.get(int(row2['position_number']), '?')
+    table_rows = [{'Metric': 'Position', player1: pos1, player2: pos2}]
+    for m in RADAR_METRICS:
+        v1, v2 = _num_or_none(row1[m]), _num_or_none(row2[m])
+        table_rows.append({
+            'Metric': RADAR_RAW_LABELS[m],
+            player1: str(round(v1, 1)) if v1 is not None else '—',
+            player2: str(round(v2, 1)) if v2 is not None else '—',
+        })
     table_df = pd.DataFrame(table_rows)
-    return fig, table_df
+    return fig, table_df, note
 
 
 # ── Section 5b: Gemini AI commentary (Player Comparison tab) ───────────────
@@ -589,17 +656,27 @@ def generate_ai_commentary(player1_name, player2_name, language):
     row1 = df_clean[df_clean['name'] == player1_name].iloc[0]
     row2 = df_clean[df_clean['name'] == player2_name].iloc[0]
 
+    _fields = [
+        ('height', 'height', 'cm'), ('spike', 'spike reach', 'cm'),
+        ('block', 'block reach', 'cm'), ('jump_power', 'jump power', 'cm'),
+        ('spike_percentile', 'spike percentile', ''),
+        ('block_percentile', 'block percentile', ''),
+    ]
+
     def _stat_block(name, row):
         pos = POSITION_NAMES.get(int(row['position_number']), 'Unknown')
-        return (
-            f"{name} (position: {pos}): "
-            f"height={float(row['height']):.0f} cm, "
-            f"spike reach={float(row['spike']):.0f} cm, "
-            f"block reach={float(row['block']):.0f} cm, "
-            f"jump power={float(row['jump_power']):.0f} cm, "
-            f"spike percentile={float(row['spike_percentile']):.0f}, "
-            f"block percentile={float(row['block_percentile']):.0f}"
-        )
+        available, missing = [], []
+        for col, label, unit in _fields:
+            v = _num_or_none(row[col])
+            if v is None:
+                missing.append(label)
+            else:
+                available.append(f"{label}={v:.0f}{(' ' + unit) if unit else ''}")
+        line = f"{name} (position: {pos}): " + ", ".join(available)
+        if missing:
+            line += (f". UNAVAILABLE (do not infer, estimate, or comment on these): "
+                     f"{', '.join(missing)}")
+        return line
 
     lang_line = ("Write the note in Turkish." if language == "Türkçe"
                  else "Write the note in English.")
@@ -607,6 +684,8 @@ def generate_ai_commentary(player1_name, player2_name, language):
     prompt = (
         "You are a volleyball scout writing a brief head-to-head note comparing "
         "two players. Base your comparison ONLY on the statistics provided below. "
+        "Some stats may be marked UNAVAILABLE — never invent, estimate, or comment "
+        "on those; compare only on the stats that are present. "
         "Do NOT invent any biographical details — no career history, teams, ages, "
         "nationalities, or achievements that are not in the data. "
         "Write 2-4 sentences maximum in a concise scouting tone, and state clearly "
@@ -675,21 +754,28 @@ def generate_player_profile(player_name, language):
     age     = _compute_age(row.get('dob'))
     age_str = f"{age} years" if age is not None else "unknown"
 
-    stat_lines = [
-        f"Position: {pos}",
-        f"Age: {age_str}",
-        f"Height: {float(row['height']):.0f} cm",
-        f"Spike reach: {float(row['spike']):.0f} cm",
-        f"Block reach: {float(row['block']):.0f} cm",
-        f"Jump power: {float(row['jump_power']):.0f} cm",
-        f"Spike percentile: {float(row['spike_percentile']):.0f}",
-        f"Block percentile: {float(row['block_percentile']):.0f}",
+    stat_lines = [f"Position: {pos}", f"Age: {age_str}"]
+    missing_stats = []
+    _profile_fields = [
+        ('height', 'Height', 'cm'), ('spike', 'Spike reach', 'cm'),
+        ('block', 'Block reach', 'cm'), ('jump_power', 'Jump power', 'cm'),
+        ('spike_percentile', 'Spike percentile', ''),
+        ('block_percentile', 'Block percentile', ''),
     ]
+    for col, label, unit in _profile_fields:
+        v = _num_or_none(row[col])
+        if v is None:
+            missing_stats.append(label)
+        else:
+            stat_lines.append(f"{label}: {v:.0f}{(' ' + unit) if unit else ''}")
+    if missing_stats:
+        stat_lines.append("UNAVAILABLE (do not infer, estimate, or comment on "
+                          f"these): {', '.join(missing_stats)}")
 
     bench_lines = []
     for m in ['height', 'spike', 'block', 'jump_power']:
-        if m in avgs:
-            val  = float(row[m])
+        val = _num_or_none(row[m])
+        if m in avgs and val is not None:
             diff = val - avgs[m]
             sign = "above" if diff >= 0 else "below"
             bench_lines.append(
@@ -703,7 +789,9 @@ def generate_player_profile(player_name, language):
     prompt = (
         "You are an expert volleyball scout writing a DETAILED scouting profile "
         "for a single player. Base everything ONLY on the statistics provided "
-        "below. Invent NO biographical facts — no teams, clubs, achievements, "
+        "below. Some stats may be marked UNAVAILABLE — never invent, estimate, or "
+        "comment on those; build the profile only from the stats that are present. "
+        "Invent NO biographical facts — no teams, clubs, achievements, "
         "career history, nationality, or personal details that are not in the "
         "data. You MAY interpret the numbers (for example, an elite block "
         "percentile suggests strong net defense), but never fabricate facts.\n\n"
@@ -731,7 +819,12 @@ def generate_player_profile(player_name, language):
 # ── Section 6: Data loading (cached) ───────────────────────────────────────
 @st.cache_data
 def load_data():
-    df = pd.read_csv('clean_data.csv')
+    # Wikipedia-sourced dataset (Turkey/Italy/Poland, 39 players). country is now
+    # a text name; spike/block/height are blank (NaN) for players Wikipedia omits.
+    # All percentiles/benchmarks below use pandas' default skipna so a blank is
+    # excluded per-metric rather than dropping the whole player. clean_data.csv is
+    # kept as a backup but no longer read.
+    df = pd.read_csv('data/final_dataset.csv')
     df_clean = df.drop_duplicates(subset=['name']).copy()
     df_clean['jump_power']       = df_clean['spike'] - df_clean['height']
     df_clean['spike_percentile'] = df_clean['spike'].rank(pct=True) * 100
@@ -865,7 +958,7 @@ with tab_bench:
         ]},
     ]
     bench_styler = (bench_disp.style
-        .format("{:.1f}", subset=numeric_cols)
+        .format("{:.1f}", subset=numeric_cols, na_rep="—")
         .hide(axis='index')
         .set_table_styles(_bench_table_styles)
     )
@@ -914,8 +1007,10 @@ with tab_compare:
         )
     st.caption("Generates a confidential scouting report for the two selected players.")
 
-    radar_fig, comp_table = build_comparison(player1, player2)
+    radar_fig, comp_table, radar_note = build_comparison(player1, player2)
     st.plotly_chart(radar_fig, width='stretch')
+    if radar_note:
+        st.caption(radar_note)
     st.dataframe(comp_table, hide_index=True, width='stretch')
 
     # ── AI Scouting Note (Gemini) ──────────────────────────────────────────
@@ -1065,7 +1160,12 @@ with tab_profile:
     pos_name = POSITION_NAMES.get(pos_num, 'Unknown')
     p_age    = _compute_age(prow.get('dob'))
     age_disp = str(p_age) if p_age is not None else "—"
-    country  = int(prow['country']) if pd.notna(prow['country']) else '—'
+    # country is now a text name (Turkey/Italy/Poland) — display it directly.
+    country  = prow['country'] if pd.notna(prow.get('country')) else '—'
+
+    def _metric_disp(col):
+        v = _num_or_none(prow[col])
+        return f"{v:.0f}" if v is not None else "—"
 
     # ── Card header: avatar beside identity ────────────────────────────────
     av_col, id_col = st.columns([1, 4])
@@ -1080,21 +1180,21 @@ with tab_profile:
             f"color:#ffffff;font-size:13px;font-weight:bold;font-family:Arial;'>"
             f"{pos_name}</div>"
             f"<div style='margin-top:8px;color:#9aa5b1;font-size:13px;"
-            f"font-family:Arial;'>Age: {age_disp}</div>",
+            f"font-family:Arial;'>Country: {country}　·　Age: {age_disp}</div>",
             unsafe_allow_html=True,
         )
 
     st.write("")
 
-    # ── Key stats ──────────────────────────────────────────────────────────
+    # ── Key stats (missing values render as '—') ───────────────────────────
     s1, s2, s3, s4 = st.columns(4)
-    s1.metric("Height (cm)",      f"{float(prow['height']):.0f}")
-    s2.metric("Spike Reach (cm)", f"{float(prow['spike']):.0f}")
-    s3.metric("Block Reach (cm)", f"{float(prow['block']):.0f}")
-    s4.metric("Jump Power (cm)",  f"{float(prow['jump_power']):.0f}")
+    s1.metric("Height (cm)",      _metric_disp('height'))
+    s2.metric("Spike Reach (cm)", _metric_disp('spike'))
+    s3.metric("Block Reach (cm)", _metric_disp('block'))
+    s4.metric("Jump Power (cm)",  _metric_disp('jump_power'))
     s5, s6 = st.columns(2)
-    s5.metric("Spike Percentile", f"{float(prow['spike_percentile']):.0f}")
-    s6.metric("Block Percentile", f"{float(prow['block_percentile']):.0f}")
+    s5.metric("Spike Percentile", _metric_disp('spike_percentile'))
+    s6.metric("Block Percentile", _metric_disp('block_percentile'))
 
     # ── Detailed AI Scouting Profile (Gemini) ──────────────────────────────
     st.markdown("---")
