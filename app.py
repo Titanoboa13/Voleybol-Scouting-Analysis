@@ -816,6 +816,371 @@ def generate_player_profile(player_name, language):
     return text
 
 
+# ── Section 5d: Team vs Team helpers (additive — own tab) ──────────────────
+# Two teams are compared position-by-position. Each team is either an uploaded
+# roster (reusing parse_uploaded_csv) or built from the database filtered to one
+# country. All per-position averages use pandas' default skipna so the ~10
+# players with blank spike/block are excluded per-metric rather than crashing.
+
+# Sample roster fixtures (also written to data/sample_team_*.csv, git-ignored).
+# Exposed via download buttons so the CSV-upload mode can be tested immediately.
+SAMPLE_TEAM_TR = (
+    "name,position_number,height,spike,block\n"
+    "Cansu Özbay,1,182,285,284\n"
+    "Melissa Vargas,2,195,326,315\n"
+    "Zehra Güneş,3,198,320,310\n"
+    "Eda Erdem,3,188,315,302\n"
+    "Ebrar Karakurt,4,193,315,304\n"
+    "İlkin Aydın,4,183,299,298\n"
+    "Gizem Örge,6,170,270,260\n"
+)
+SAMPLE_TEAM_IT = (
+    "name,position_number,height,spike,block\n"
+    "Alessia Orro,1,178,304,285\n"
+    "Paola Egonu,2,195,344,321\n"
+    "Anna Danesi,3,198,315,306\n"
+    "Sarah Fahr,3,192,322,306\n"
+    "Myriam Sylla,4,184,320,315\n"
+    "Monica De Gennaro,6,174,298,215\n"
+)
+SAMPLE_TEAM_PL = (
+    "name,position_number,height,spike,block\n"
+    "Joanna Wołosz,1,181,303,281\n"
+    "Malwina Smarzek,2,191,318,292\n"
+    "Klaudia Alagierska,3,190,297,290\n"
+    "Martyna Łukasik,4,189,315,288\n"
+    "Natalia Mędrzyk,4,185,293,282\n"
+    "Maria Stenzel,6,168,278,262\n"
+)
+
+# Two distinct team colours (A = blue, B = red), reused in the table + chart.
+_TVT_COLOR_A = '#2980b9'
+_TVT_COLOR_B = '#e74c3c'
+
+# 5-1 system lineup: (position_number, number of slots). Total = 7 players.
+# Used ONLY by "Build from database" mode to enforce a realistic roster shape.
+TVT_LINEUP = [(1, 1), (2, 1), (3, 2), (4, 2), (6, 1)]
+TVT_LINEUP_SIZE = sum(n for _, n in TVT_LINEUP)
+
+_TVT_TABLE_STYLES = [
+    {'selector': 'table', 'props': [('width', '100%'), ('border-collapse', 'collapse')]},
+    {'selector': 'th', 'props': [
+        ('background-color', '#2c3e50'), ('color', 'white'),
+        ('padding', '8px 12px'), ('text-align', 'center'),
+        ('font-family', 'Arial'), ('font-size', '12px'), ('font-weight', 'bold'),
+    ]},
+    {'selector': 'td', 'props': [
+        ('color', '#e0e0e0'), ('padding', '8px 12px'), ('text-align', 'center'),
+        ('font-family', 'Arial'), ('font-size', '13px'),
+        ('border-bottom', '1px solid #3a3a3a'),
+    ]},
+]
+
+
+def _team_from_db(player_names):
+    """Build a team roster DataFrame from selected database players. The needed
+    columns (jump_power, position_name) already exist on df_clean."""
+    sub = df_clean[df_clean['name'].isin(player_names)][
+        ['name', 'position_number', 'height', 'spike', 'block',
+         'jump_power', 'position_name']
+    ].copy()
+    return sub.reset_index(drop=True)
+
+
+def _team_position_stats(team_df):
+    """Per-position averages for every position. Returns
+    {pos_num: {'count': n, 'metrics': {metric: float|None}}}.
+    A metric average is None when the position is empty OR every player in it is
+    missing that stat (mean of an all-NaN slice is NaN → None)."""
+    stats = {}
+    for pos_num in POSITION_NAMES:
+        pos_players = team_df[team_df['position_number'] == pos_num]
+        count = len(pos_players)
+        metrics = {}
+        for m in METRICS:
+            if count == 0:
+                metrics[m] = None
+            else:
+                val = pos_players[m].mean()          # skipna default
+                metrics[m] = None if pd.isna(val) else round(float(val), 1)
+        stats[pos_num] = {'count': count, 'metrics': metrics}
+    return stats
+
+
+def _position_metric_winner(va, vb):
+    """'A', 'B', or None (None when either value is missing or they tie)."""
+    if va is None or vb is None:
+        return None
+    if va > vb:
+        return 'A'
+    if vb > va:
+        return 'B'
+    return None
+
+
+def build_tvt_table(stats_a, stats_b, label_a, label_b):
+    """Long-format position×metric comparison table. Returns (DataFrame,
+    highlights) where highlights[i] is 'A'/'B'/None marking which side's cell to
+    shade green for row i."""
+    rows, highlights = [], []
+    for pos_num, pos_name in POSITION_NAMES.items():
+        ma = stats_a[pos_num]['metrics']
+        mb = stats_b[pos_num]['metrics']
+        for m in METRICS:
+            va, vb = ma[m], mb[m]
+            a_str = f"{va:.1f}" if va is not None else "—"
+            b_str = f"{vb:.1f}" if vb is not None else "—"
+            win = _position_metric_winner(va, vb)
+            if va is None or vb is None:
+                edge = "—"
+            elif win == 'A':
+                edge = f"{label_a} ▲"
+            elif win == 'B':
+                edge = f"{label_b} ▲"
+            else:
+                edge = "Even"
+            rows.append({'Position': pos_name, 'Metric': METRIC_SHORT[m],
+                         label_a: a_str, label_b: b_str, 'Edge': edge})
+            highlights.append(win)
+    return pd.DataFrame(rows), highlights
+
+
+def _tvt_table_html(stats_a, stats_b, label_a, label_b):
+    """Render build_tvt_table as highlighted HTML (Styler.apply inline styles
+    survive to_html, so they aren't overridden like st.dataframe would)."""
+    df, highlights = build_tvt_table(stats_a, stats_b, label_a, label_b)
+    # Light green background WITH dark bold text so the value stays readable —
+    # same dark-theme-vs-light-highlight fix as the benchmark/weakness tables.
+    # !important guards against Streamlit's dark-theme td color rule.
+    win_css = ('background-color:#e8f5e9 !important;color:#1a1a1a !important;'
+               'font-weight:bold;')
+
+    def _shade(_):
+        css = pd.DataFrame('', index=df.index, columns=df.columns)
+        for i, win in enumerate(highlights):
+            if win == 'A':
+                css.loc[i, label_a] = win_css
+            elif win == 'B':
+                css.loc[i, label_b] = win_css
+        return css
+
+    styler = (df.style
+        .apply(_shade, axis=None)
+        .hide(axis='index')
+        .set_table_styles(_TVT_TABLE_STYLES))
+    return styler.to_html()
+
+
+def build_tvt_position_chart(stats_a, stats_b, label_a, label_b, metric):
+    """Grouped bar chart of one metric's per-position averages, Team A vs B."""
+    positions = [POSITION_NAMES[p] for p in POSITION_NAMES]
+    ya = [stats_a[p]['metrics'][metric] for p in POSITION_NAMES]
+    yb = [stats_b[p]['metrics'][metric] for p in POSITION_NAMES]
+    fig = go.Figure([
+        go.Bar(name=label_a, x=positions, y=ya, marker_color=_TVT_COLOR_A,
+               text=[f"{v:.0f}" if v is not None else "" for v in ya],
+               textposition='outside'),
+        go.Bar(name=label_b, x=positions, y=yb, marker_color=_TVT_COLOR_B,
+               text=[f"{v:.0f}" if v is not None else "" for v in yb],
+               textposition='outside'),
+    ])
+    fig.update_layout(
+        barmode='group', title=f'{METRIC_LABELS[metric]} — Average by Position',
+        xaxis_title='Position', yaxis_title=METRIC_LABELS[metric],
+        legend_title='Team', font={'family': 'Arial'}, plot_bgcolor='white',
+        yaxis=dict(gridcolor='#eeeeee', rangemode='tozero'),
+        uniformtext_minsize=8, uniformtext_mode='hide',
+    )
+    return fig
+
+
+def tvt_summary_and_warnings(stats_a, stats_b, label_a, label_b):
+    """Strengths/weaknesses + tactical warnings. Returns
+    (a_advantage, b_advantage, even, warnings) — first three are position-name
+    lists, the last a list of warning strings."""
+    a_adv, b_adv, even, warnings = [], [], [], []
+    for pos_num, pos_name in POSITION_NAMES.items():
+        ca = stats_a[pos_num]['count']
+        cb = stats_b[pos_num]['count']
+        if ca == 0 and cb == 0:
+            warnings.append(f"Neither team fields a {pos_name}.")
+            continue
+        if ca == 0:
+            warnings.append(f"{label_a} has no {pos_name} — {label_b} is unopposed here.")
+            b_adv.append(pos_name)
+            continue
+        if cb == 0:
+            warnings.append(f"{label_b} has no {pos_name} — {label_a} is unopposed here.")
+            a_adv.append(pos_name)
+            continue
+        a_wins = b_wins = comparable = 0
+        for m in METRICS:
+            win = _position_metric_winner(stats_a[pos_num]['metrics'][m],
+                                          stats_b[pos_num]['metrics'][m])
+            if win is None:
+                continue
+            comparable += 1
+            if win == 'A':
+                a_wins += 1
+            else:
+                b_wins += 1
+        if a_wins > b_wins:
+            a_adv.append(pos_name)
+        elif b_wins > a_wins:
+            b_adv.append(pos_name)
+        else:
+            even.append(pos_name)
+        # Clear mismatch: one side leads every comparable metric (≥3 of 4).
+        if comparable >= 3 and a_wins == comparable:
+            warnings.append(f"{label_b} is weak at {pos_name} — "
+                            f"{label_a} leads every measured metric.")
+        elif comparable >= 3 and b_wins == comparable:
+            warnings.append(f"{label_a} is weak at {pos_name} — "
+                            f"{label_b} leads every measured metric.")
+    return a_adv, b_adv, even, warnings
+
+
+def _tvt_gemini_summary(stats_a, stats_b, label_a, label_b):
+    """Plain-text per-position stat summary fed to Gemini. Missing averages are
+    marked NA so the model is told not to infer them."""
+    lines = []
+    for pos_num, pos_name in POSITION_NAMES.items():
+        def _fmt(stats):
+            if stats['count'] == 0:
+                return "no players"
+            parts = []
+            for m in METRICS:
+                v = stats['metrics'][m]
+                parts.append(f"{METRIC_SHORT[m]}={v:.1f}" if v is not None
+                             else f"{METRIC_SHORT[m]}=NA")
+            return f"{stats['count']} player(s), avg " + ", ".join(parts)
+        lines.append(f"{pos_name} — {label_a}: {_fmt(stats_a[pos_num])} | "
+                     f"{label_b}: {_fmt(stats_b[pos_num])}")
+    return "\n".join(lines)
+
+
+@st.cache_data(show_spinner=False)
+def generate_tvt_commentary(label_a, label_b, roster_key_a, roster_key_b,
+                            summary_text, language):
+    """Gemini tactical analysis of Team A vs Team B.
+
+    Cached on every argument; roster_key_a/roster_key_b (sorted player-name
+    tuples) plus summary_text fully capture each team's composition, so a unique
+    matchup+language triggers at most one API call. Fed ONLY the aggregated
+    numbers in summary_text. Raises on failure so the caller can warn and so
+    transient errors are not cached."""
+    key = _get_gemini_key()
+    if not key:
+        raise RuntimeError("Gemini key not configured")
+
+    lang_line = ("Write the analysis in Turkish." if language == "Türkçe"
+                 else "Write the analysis in English.")
+    prompt = (
+        "You are a volleyball tactical analyst comparing two teams position by "
+        "position. Base your analysis ONLY on the per-position average statistics "
+        "provided below (height, spike reach, block reach, jump power in cm). "
+        "Stats marked NA are unavailable — never infer, estimate, or comment on "
+        "them. Invent NO facts about real matches, history, results, players' "
+        "careers, or anything not in these numbers.\n\n"
+        "Write a concise tactical analysis (4-7 sentences) covering: where "
+        f"{label_a} should attack, where {label_b} is vulnerable, the key "
+        "positional matchups, and any position where a team is missing players. "
+        "State clearly which team holds the overall edge.\n\n"
+        f"TEAM A = {label_a}\nTEAM B = {label_b}\n\n"
+        "PER-POSITION AVERAGES:\n" + summary_text + "\n\n" + lang_line
+    )
+
+    from google import genai
+    client = genai.Client(api_key=key)
+    resp = client.models.generate_content(model=GEMINI_MODEL, contents=prompt)
+    text = (resp.text or "").strip()
+    if not text:
+        raise ValueError("Gemini returned an empty response")
+    return text
+
+
+def tvt_team_input(prefix, default_country):
+    """Render one team's input block (mode toggle + inputs) and return
+    (team_df | None, label, roster_key | None, error | None). Used twice (Team A,
+    Team B) with a unique widget-key prefix so the two blocks never clash."""
+    mode = st.radio(
+        "Input mode", ["Build from database", "Upload CSV"],
+        key=f'{prefix}_mode', horizontal=True,
+    )
+    if mode == "Upload CSV":
+        up = st.file_uploader("Team roster CSV", type='csv', key=f'{prefix}_upload')
+        if up is None:
+            return None, None, None, "Upload a CSV roster above."
+        team_df, err = parse_uploaded_csv(up)
+        if err:
+            return None, None, None, err
+        label = up.name.rsplit('.', 1)[0]
+        roster_key = tuple(sorted(team_df['name'].astype(str)))
+        return team_df, label, roster_key, None
+
+    # Build-from-database mode — country-filtered, 5-1 position-slot lineup.
+    countries = sorted(df_clean['country'].dropna().unique())
+    idx = countries.index(default_country) if default_country in countries else 0
+    country = st.selectbox("Country", countries, index=idx, key=f'{prefix}_country')
+    pool = df_clean[df_clean['country'] == country]
+
+    st.caption(
+        f"Full 5-1 lineup = {TVT_LINEUP_SIZE} players "
+        "(Setter ×1, Opposite ×1, Middle Blocker ×2, Outside Hitter ×2, Libero ×1). "
+        "Each slot's dropdown lists only this country's players for that position; "
+        "a player picked in one slot is removed from the others. Slots may be left "
+        "empty for a partial lineup."
+    )
+
+    # Country-filtered name pool per position (sorted for stable dropdowns).
+    names_by_pos = {
+        pos_num: list(pool[pool['position_number'] == pos_num]
+                      .sort_values('name')['name'])
+        for pos_num, _ in TVT_LINEUP
+    }
+    # Every slot's widget key, in render order.
+    slot_keys = [
+        (pos_num, j, f'{prefix}_slot_{pos_num}_{j}')
+        for pos_num, n in TVT_LINEUP
+        for j in range(n)
+    ]
+    # Clean stale picks (e.g. after switching country) so no widget ever holds a
+    # value absent from its current options — that would raise in Streamlit.
+    for pos_num, _j, k in slot_keys:
+        val = st.session_state.get(k)
+        if val is not None and val not in names_by_pos[pos_num]:
+            st.session_state[k] = None
+
+    picked = []
+    for pos_num, n in TVT_LINEUP:
+        pos_name = POSITION_NAMES[pos_num]
+        pos_players = names_by_pos[pos_num]
+        for j in range(n):
+            this_key = f'{prefix}_slot_{pos_num}_{j}'
+            # Players already chosen in any OTHER slot are unavailable here. A
+            # slot can never collide with its own value because every other slot
+            # already excluded this slot's pick, so duplicates are impossible.
+            taken = {st.session_state.get(k) for (_p, _q, k) in slot_keys
+                     if k != this_key}
+            taken.discard(None)
+            options = [None] + [p for p in pos_players if p not in taken]
+            slot_label = pos_name + (f" #{j + 1}" if n > 1 else "")
+            sel = st.selectbox(
+                slot_label, options, key=this_key,
+                format_func=lambda v: "— (empty) —" if v is None
+                else _player_labels.get(v, v),
+            )
+            if sel:
+                picked.append(sel)
+
+    st.caption(f"Lineup: {len(picked)}/{TVT_LINEUP_SIZE} slots filled.")
+    if not picked:
+        return None, country, None, f"Fill at least one {country} lineup slot."
+    team_df = _team_from_db(picked)
+    roster_key = tuple(sorted(picked))
+    return team_df, country, roster_key, None
+
+
 # ── Section 6: Data loading (cached) ───────────────────────────────────────
 @st.cache_data
 def load_data():
@@ -899,9 +1264,9 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-tab_scout, tab_bench, tab_compare, tab_team, tab_profile = st.tabs(
+tab_scout, tab_bench, tab_compare, tab_team, tab_profile, tab_tvt = st.tabs(
     ['Player Scout', 'Position Benchmarks', 'Player Comparison',
-     'Team Analysis', 'Player Profile']
+     'Team Analysis', 'Player Profile', 'Team vs Team']
 )
 
 # ── Tab 1: Player Scout ────────────────────────────────────────────────────
@@ -1212,3 +1577,132 @@ with tab_profile:
             st.markdown(profile_text)
         except Exception as exc:
             st.warning(f"AI profile unavailable: {type(exc).__name__}: {exc}")
+
+# ── Tab 6: Team vs Team ────────────────────────────────────────────────────
+with tab_tvt:
+    st.subheader("Team vs Team Comparison")
+    st.caption("Compare two teams position-by-position. Each team can be built "
+               "from the database (country-filtered) or uploaded as a CSV roster. "
+               "Players with blank spike/block are excluded per-metric from averages.")
+
+    # Sample roster downloads (for testing the CSV-upload mode).
+    st.markdown("**Sample rosters** (download, then upload via 'Upload CSV' mode):")
+    dl1, dl2, dl3 = st.columns(3)
+    dl1.download_button("Turkey sample", data=SAMPLE_TEAM_TR,
+                        file_name='sample_team_turkey.csv', mime='text/csv',
+                        key='tvt_dl_tr')
+    dl2.download_button("Italy sample", data=SAMPLE_TEAM_IT,
+                        file_name='sample_team_italy.csv', mime='text/csv',
+                        key='tvt_dl_it')
+    dl3.download_button("Poland sample", data=SAMPLE_TEAM_PL,
+                        file_name='sample_team_poland.csv', mime='text/csv',
+                        key='tvt_dl_pl')
+
+    st.markdown("---")
+
+    # ── Team inputs (independent modes) ────────────────────────────────────
+    in_a, in_b = st.columns(2)
+    with in_a:
+        st.markdown("### Team A")
+        team_a_df, label_a_src, key_a, err_a = tvt_team_input('tvt_a', 'Turkey')
+    with in_b:
+        st.markdown("### Team B")
+        team_b_df, label_b_src, key_b, err_b = tvt_team_input('tvt_b', 'Italy')
+
+    # Distinct column labels (the A/B prefix guarantees uniqueness even if both
+    # teams pick the same country).
+    label_a = f"A · {label_a_src}" if label_a_src else "Team A"
+    label_b = f"B · {label_b_src}" if label_b_src else "Team B"
+
+    if team_a_df is None or team_b_df is None:
+        if err_a:
+            st.info(f"Team A: {err_a}")
+        if err_b:
+            st.info(f"Team B: {err_b}")
+        st.caption("Configure both teams above to see the comparison.")
+    else:
+        st.success(f"Comparing {label_a} ({len(team_a_df)} players) vs "
+                   f"{label_b} ({len(team_b_df)} players)")
+
+        # Roster previews
+        rp_a, rp_b = st.columns(2)
+        _roster_cols = {'name': 'Name', 'position_name': 'Position',
+                        'height': 'Height', 'spike': 'Spike',
+                        'block': 'Block', 'jump_power': 'Jump Pwr'}
+        with rp_a:
+            st.markdown(f"**{label_a} roster**")
+            st.dataframe(team_a_df[list(_roster_cols)].rename(columns=_roster_cols),
+                         hide_index=True, width='stretch')
+        with rp_b:
+            st.markdown(f"**{label_b} roster**")
+            st.dataframe(team_b_df[list(_roster_cols)].rename(columns=_roster_cols),
+                         hide_index=True, width='stretch')
+
+        stats_a = _team_position_stats(team_a_df)
+        stats_b = _team_position_stats(team_b_df)
+
+        # ── Position-by-position chart ─────────────────────────────────────
+        st.markdown("### Position-by-Position Averages")
+        tvt_metric = st.selectbox(
+            "Metric to chart", METRICS, index=METRICS.index('spike'),
+            format_func=lambda m: METRIC_LABELS[m], key='tvt_metric',
+        )
+        st.plotly_chart(
+            build_tvt_position_chart(stats_a, stats_b, label_a, label_b, tvt_metric),
+            width='stretch',
+        )
+
+        # ── Detailed comparison table ──────────────────────────────────────
+        st.markdown("#### Detailed comparison")
+        st.caption("Green cell = the stronger team for that position & metric. "
+                   "'—' means one team has no player / no value there.")
+        st.markdown(
+            f'<div style="overflow-x:auto">'
+            f'{_tvt_table_html(stats_a, stats_b, label_a, label_b)}</div>',
+            unsafe_allow_html=True,
+        )
+
+        # ── Strengths / weaknesses + tactical warnings ─────────────────────
+        a_adv, b_adv, even, warnings = tvt_summary_and_warnings(
+            stats_a, stats_b, label_a, label_b)
+
+        st.markdown("### Strengths & Weaknesses")
+        sw_a, sw_b, sw_e = st.columns(3)
+        with sw_a:
+            st.markdown(f"**{label_a} advantage**")
+            st.markdown("\n".join(f"- {p}" for p in a_adv) if a_adv
+                        else "_None_")
+        with sw_b:
+            st.markdown(f"**{label_b} advantage**")
+            st.markdown("\n".join(f"- {p}" for p in b_adv) if b_adv
+                        else "_None_")
+        with sw_e:
+            st.markdown("**Even**")
+            st.markdown("\n".join(f"- {p}" for p in even) if even
+                        else "_None_")
+
+        st.markdown("### Tactical Warnings")
+        if warnings:
+            for w in warnings:
+                st.warning(w)
+        else:
+            st.success("No missing positions or one-sided mismatches detected.")
+
+        # ── Gemini tactical commentary ─────────────────────────────────────
+        st.markdown("---")
+        st.subheader("AI Tactical Analysis")
+        tvt_lang = st.radio(
+            "Analiz dili / Analysis language",
+            ["Türkçe", "English"], index=0, horizontal=True, key='tvt_lang',
+        )
+        if _get_gemini_key() is None:
+            st.info("AI analysis unavailable: Gemini key not configured")
+        else:
+            summary_text = _tvt_gemini_summary(stats_a, stats_b, label_a, label_b)
+            try:
+                with st.spinner("Generating AI tactical analysis..."):
+                    tvt_note = generate_tvt_commentary(
+                        label_a, label_b, key_a, key_b, summary_text, tvt_lang)
+                st.markdown(tvt_note)
+            except Exception as exc:
+                st.warning(f"AI analysis unavailable: {type(exc).__name__}: {exc}")

@@ -9,7 +9,8 @@ __pycache__/
 *.log
 data/chroma_db/
 .streamlit/secrets.toml
-# Locally-scraped Wikipedia datasets — stay local, never push to GitHub
+# All CSVs in data/ stay local — scraped datasets, sample rosters, future files
+data/*.csv
 data/final_dataset.csv
 data/new_dataset.csv
 data/new_dataset_test.csv
